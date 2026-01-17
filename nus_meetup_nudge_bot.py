@@ -18,9 +18,12 @@ from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
+
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 # ============================================================
 # Load env
@@ -80,7 +83,15 @@ WAKE_WORDS = ("bot", "annoyotron", "oi bot")
 
 # AutoPoke: bot speaks on its own
 AUTOPOKE_DEFAULT_INTERVAL_MIN = 180   # every 3 hours (when enabled)
-AUTOPOKE_MIN_SILENCE_MIN = 60         # only speak if chat quiet for >= 60 min
+AUTOPOKE_MIN_SILENCE_MIN = 0         # Changed to 0 for testing
+
+CANTEENS = {
+    "UTown": ["Fine Food", "Flavors"],
+    "Central": ["The Deck", "Frontier"],
+    "SoC": ["The Terrace"],
+    "Biz": ["The Pulse"],
+    "Other": ["Techno Edge", "PGPR"]
+}
 
 # ============================================================
 # DB
@@ -128,6 +139,31 @@ def init_db():
     )
     """)
 
+    # Meetup tables
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS meetup_sessions (
+        session_id TEXT PRIMARY KEY,
+        chat_id INTEGER,
+        status TEXT, -- 'collecting_area', 'collecting_time', 'confirmed', 'cancelled'
+        area TEXT,
+        time TEXT,
+        created_by INTEGER,
+        created_ts INTEGER,
+        confirmed_ts INTEGER,
+        nag_interval_min INTEGER DEFAULT 5
+    )
+    """)
+
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS meetup_votes (
+        session_id TEXT,
+        user_id INTEGER,
+        vote_type TEXT, -- 'area', 'time'
+        vote_value TEXT,
+        PRIMARY KEY (session_id, user_id, vote_type)
+    )
+    """)
+
     # Migrations for older DBs (idempotent)
     _add_column_if_missing(conn, "chats", "chaos_enabled INTEGER DEFAULT 0")
     _add_column_if_missing(conn, "chats", "roast_level INTEGER DEFAULT 2")
@@ -138,6 +174,8 @@ def init_db():
     _add_column_if_missing(conn, "members", "roast_opt_in INTEGER DEFAULT 0")
     _add_column_if_missing(conn, "members", "last_message_ts INTEGER DEFAULT 0")
     _add_column_if_missing(conn, "members", "last_snippet TEXT DEFAULT ''")
+
+    _add_column_if_missing(conn, "meetup_sessions", "nag_interval_min INTEGER DEFAULT 5")
 
     conn.commit()
     conn.close()
@@ -545,6 +583,106 @@ async def restore_jobs(application: Application):
         _schedule_autopoke(application, chat_id, interval_min)
     logger.info("Restored %d autopoke jobs", len(rows))
 
+async def start_meetup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    # Check if active session exists
+    row = await db_fetchone("SELECT session_id FROM meetup_sessions WHERE chat_id=? AND status NOT IN ('confirmed', 'cancelled')", (chat_id,))
+    if row:
+        await safe_reply(update.effective_message, "🚨 A meetup is already being planned! Use /meetup_status.")
+        return
+
+    # Parse optional nag interval (in minutes)
+    nag_interval = 5  # default
+    if context.args:
+        try:
+            nag_interval = int(context.args[0])
+            nag_interval = max(1, min(60, nag_interval))  # 1-60 minutes
+        except ValueError:
+            await safe_reply(update.effective_message, "Usage: /meetup [nag_interval_minutes] (e.g. /meetup 3)")
+            return
+
+    session_id = f"m_{chat_id}_{now_ts()}"
+    await db_exec("""
+        INSERT INTO meetup_sessions (session_id, chat_id, status, created_by, created_ts, nag_interval_min)
+        VALUES (?, ?, 'collecting_area', ?, ?, ?)
+    """, (session_id, chat_id, update.effective_user.id, now_ts(), nag_interval))
+
+    keyboard = [[InlineKeyboardButton(area, callback_data=f"area_{session_id}_{area}")] for area in CANTEENS.keys()]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await context.bot.send_message(chat_id=chat_id, text=f"📍 **MEETUP TIME.** Where we going? Vote for an area!\n(Nagging every {nag_interval} min)", reply_markup=reply_markup, parse_mode="Markdown")
+
+    # Start the nag job for this specific chat
+    context.application.job_queue.run_repeating(
+        meetup_nag_job, interval=60 * nag_interval, chat_id=chat_id, name=f"nag_{chat_id}"
+    )
+
+async def meetup_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data
+    parts = data.split("_", 2)
+    if len(parts) < 3:
+        return
+
+    vote_type = parts[0]  # "area" or "time"
+    session_id = f"{parts[0]}_{parts[1]}"
+    vote_value = parts[2]
+
+    user_id = query.from_user.id
+
+    # Record vote
+    await db_exec("""
+        INSERT INTO meetup_votes (session_id, user_id, vote_type, vote_value)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(session_id, user_id, vote_type) DO UPDATE SET vote_value=excluded.vote_value
+    """, (session_id, user_id, vote_type, vote_value))
+
+    # Show updated vote count
+    votes = await db_fetchall("SELECT vote_value, COUNT(*) as cnt FROM meetup_votes WHERE session_id=? AND vote_type=? GROUP BY vote_value", (session_id, vote_type))
+    vote_summary = "\n".join([f"{row['vote_value']}: {row['cnt']} votes" for row in votes])
+
+    await query.edit_message_text(f"📍 **MEETUP TIME.** Where we going?\n\n{vote_summary}", parse_mode="Markdown")
+
+async def meetup_nag_job(context: ContextTypes.DEFAULT_TYPE):
+    chat_id = context.job.chat_id
+    if in_quiet_hours():
+        return
+
+    session = await db_fetchone("SELECT * FROM meetup_sessions WHERE chat_id=? AND status NOT IN ('confirmed', 'cancelled')", (chat_id,))
+    if not session:
+        context.job.schedule_removal()
+        return
+
+    session_id = session["session_id"]
+
+    # Get all members in the chat
+    all_members = await db_fetchall("SELECT user_id, username, first_name FROM members WHERE chat_id=?", (chat_id,))
+
+    # Get members who have voted
+    voted_users = await db_fetchall("SELECT DISTINCT user_id FROM meetup_votes WHERE session_id=?", (session_id,))
+    voted_ids = {row["user_id"] for row in voted_users}
+
+    # Find non-voters
+    non_voters = [m for m in all_members if m["user_id"] not in voted_ids]
+
+    if not non_voters:
+        return
+
+    # Mention non-voters
+    mentions = []
+    for m in non_voters[:5]:  # Limit to 5 mentions to avoid spam
+        username = m["username"]
+        if username:
+            mentions.append(f"@{username}")
+        else:
+            first_name = m["first_name"] or "someone"
+            mentions.append(first_name)
+
+    nag_text = f"Oi {', '.join(mentions)}! Wake up. We are planning a meetup and you haven't voted. Don't be a snake. 🐍"
+    await safe_send(context.bot, chat_id, nag_text)
+
 # ============================================================
 # Error handler
 # ============================================================
@@ -684,16 +822,20 @@ def main():
     app.add_handler(CommandHandler("roast_optout", roast_optout))
     app.add_handler(CommandHandler("autopoke_on", autopoke_on))
     app.add_handler(CommandHandler("autopoke_off", autopoke_off))
-    app.add_handler(CommandHandler("openai_test", openai_test))
     app.add_handler(CommandHandler("status", status))
+    app.add_handler(CommandHandler("openai_test", openai_test))
+    app.add_handler(CommandHandler("meetup", start_meetup))
 
-    # Text handler (LLM-style)
+    # Callback query handler for meetup buttons
+    app.add_handler(CallbackQueryHandler(meetup_callback))
+
+    # Message handler
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
     # Error handler
     app.add_error_handler(error_handler)
 
-    logger.info("Annoyotron running (polling).")
+    logger.info("Bot starting...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
