@@ -21,6 +21,7 @@ from telegram.ext import (
     CallbackQueryHandler,
     ContextTypes,
     filters,
+    JobQueue,
 )
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
@@ -150,7 +151,9 @@ def init_db():
         created_by INTEGER,
         created_ts INTEGER,
         confirmed_ts INTEGER,
-        nag_interval_min INTEGER DEFAULT 5
+        nag_interval_min INTEGER DEFAULT 5,
+        first_nag_ts INTEGER DEFAULT 0,
+        nag_started INTEGER DEFAULT 0
     )
     """)
 
@@ -176,6 +179,8 @@ def init_db():
     _add_column_if_missing(conn, "members", "last_snippet TEXT DEFAULT ''")
 
     _add_column_if_missing(conn, "meetup_sessions", "nag_interval_min INTEGER DEFAULT 5")
+    _add_column_if_missing(conn, "meetup_sessions", "first_nag_ts INTEGER DEFAULT 0")
+    _add_column_if_missing(conn, "meetup_sessions", "nag_started INTEGER DEFAULT 0")
 
     conn.commit()
     conn.close()
@@ -355,6 +360,9 @@ HELP_TEXT = (
     "/autopoke_on [minutes] – I will message on my own schedule\n"
     "/autopoke_off – stop autopoke\n"
     "/openai_test – test OpenAI from Telegram\n"
+    "/meetup [timeout_min] [nag_interval_min] – start a meetup poll (e.g. /meetup 2 3)\n"
+    "/meetup_status – show voting progress\n"
+    "/meetup_cancel – cancel the current meetup\n"
     "/status – show current settings\n"
 )
 
@@ -591,26 +599,34 @@ async def start_meetup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_reply(update.effective_message, "🚨 A meetup is already being planned! Use /meetup_status.")
         return
 
-    # Parse optional nag interval (in minutes)
-    nag_interval = 5  # default
+    # Parse optional nag interval and timeout (in minutes)
+    # Usage: /meetup [timeout_before_nag] [nag_interval]
+    timeout_before_nag = 2  # default: wait 2 min before first nag
+    nag_interval = 3        # default: nag every 3 min after that
+    
     if context.args:
         try:
-            nag_interval = int(context.args[0])
-            nag_interval = max(1, min(60, nag_interval))  # 1-60 minutes
+            if len(context.args) >= 1:
+                timeout_before_nag = int(context.args[0])
+                timeout_before_nag = max(1, min(30, timeout_before_nag))
+            if len(context.args) >= 2:
+                nag_interval = int(context.args[1])
+                nag_interval = max(1, min(60, nag_interval))
         except ValueError:
-            await safe_reply(update.effective_message, "Usage: /meetup [nag_interval_minutes] (e.g. /meetup 3)")
+            await safe_reply(update.effective_message, "Usage: /meetup [timeout_min] [nag_interval_min]\n(e.g. /meetup 2 3 = nag after 2 min, then every 3 min)")
             return
 
-    session_id = f"m_{chat_id}_{now_ts()}"
+    ts = now_ts()
+    session_id = f"m_{chat_id}_{ts}"
     await db_exec("""
-        INSERT INTO meetup_sessions (session_id, chat_id, status, created_by, created_ts, nag_interval_min)
-        VALUES (?, ?, 'collecting_area', ?, ?, ?)
-    """, (session_id, chat_id, update.effective_user.id, now_ts(), nag_interval))
+        INSERT INTO meetup_sessions (session_id, chat_id, status, created_by, created_ts, nag_interval_min, first_nag_ts)
+        VALUES (?, ?, 'collecting_area', ?, ?, ?, ?)
+    """, (session_id, chat_id, update.effective_user.id, ts, nag_interval, ts + (timeout_before_nag * 60)))
 
-    keyboard = [[InlineKeyboardButton(area, callback_data=f"area_{session_id}_{area}")] for area in CANTEENS.keys()]
+    keyboard = [[InlineKeyboardButton(area, callback_data=f"area_{chat_id}_{ts}_{area}") for area in CANTEENS.keys()]]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    await context.bot.send_message(chat_id=chat_id, text=f"📍 **MEETUP TIME.** Where we going? Vote for an area!\n(Nagging every {nag_interval} min)", reply_markup=reply_markup, parse_mode="Markdown")
+    await context.bot.send_message(chat_id=chat_id, text=f"📊 **MEETUP POLL** Where we going? Vote for an area!\n(I'll start nagging in {timeout_before_nag} min if people don't vote)", reply_markup=reply_markup, parse_mode="Markdown")
 
     # Start the nag job for this specific chat
     context.application.job_queue.run_repeating(
@@ -622,15 +638,26 @@ async def meetup_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     data = query.data
-    parts = data.split("_", 2)
-    if len(parts) < 3:
+    # Format: area_CHATID_TIMESTAMP_AREA
+    parts = data.split("_", 3)
+    if len(parts) < 4:
         return
 
     vote_type = parts[0]  # "area" or "time"
-    session_id = f"{parts[0]}_{parts[1]}"
-    vote_value = parts[2]
-
+    chat_id_str = parts[1]
+    ts_str = parts[2]
+    vote_value = parts[3]
+    
+    session_id = f"m_{chat_id_str}_{ts_str}"
     user_id = query.from_user.id
+    
+    try:
+        chat_id = int(chat_id_str)
+    except ValueError:
+        return
+    
+    # Ensure user is tracked in members table
+    await ensure_member_row(chat_id, query.from_user)
 
     # Record vote
     await db_exec("""
@@ -639,11 +666,57 @@ async def meetup_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ON CONFLICT(session_id, user_id, vote_type) DO UPDATE SET vote_value=excluded.vote_value
     """, (session_id, user_id, vote_type, vote_value))
 
-    # Show updated vote count
-    votes = await db_fetchall("SELECT vote_value, COUNT(*) as cnt FROM meetup_votes WHERE session_id=? AND vote_type=? GROUP BY vote_value", (session_id, vote_type))
-    vote_summary = "\n".join([f"{row['vote_value']}: {row['cnt']} votes" for row in votes])
+    # Get vote counts for each option (filtered by vote_type)
+    votes = await db_fetchall("SELECT vote_value, COUNT(*) as cnt FROM meetup_votes WHERE session_id=? AND vote_type=? GROUP BY vote_value ORDER BY cnt DESC", (session_id, vote_type))
+    vote_map = {row['vote_value']: row['cnt'] for row in votes}
+    
+    # Rebuild keyboard with vote counts
+    if vote_type == "area":
+        options = list(CANTEENS.keys())
+    else:
+        # If time voting, get available times (for now, just show areas)
+        options = list(CANTEENS.keys())
+    
+    keyboard = []
+    for option in options:
+        count = vote_map.get(option, 0)
+        button_text = f"{option} ({count})" if count > 0 else option
+        callback = f"{vote_type}_{chat_id_str}_{ts_str}_{option}"
+        keyboard.append([InlineKeyboardButton(button_text, callback_data=callback)])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    vote_summary = "\n".join([f"{row['vote_value']}: {row['cnt']} votes" for row in votes]) if votes else "No votes yet"
+    
+    await query.edit_message_text(f"📊 **MEETUP POLL** – Where we going?\n\n{vote_summary}\n\n(Vote to continue, or wait for results)", reply_markup=reply_markup, parse_mode="Markdown")
 
-    await query.edit_message_text(f"📍 **MEETUP TIME.** Where we going?\n\n{vote_summary}", parse_mode="Markdown")
+async def meetup_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    
+    # Find active session
+    session = await db_fetchone("SELECT * FROM meetup_sessions WHERE chat_id=? AND status NOT IN ('confirmed', 'cancelled')", (chat_id,))
+    if not session:
+        await safe_reply(update.effective_message, "No active meetup to cancel.")
+        return
+    
+    # Only creator or admins can cancel (for now, just check if they're the creator)
+    created_by = int(session["created_by"] or 0)
+    if user_id != created_by:
+        await safe_reply(update.effective_message, "Only the person who started the meetup can cancel it.")
+        return
+    
+    session_id = session["session_id"]
+    await db_exec("UPDATE meetup_sessions SET status='cancelled' WHERE session_id=?", (session_id,))
+    
+    # Stop the nag job
+    try:
+        job = context.application.job_queue.get_jobs_by_name(f"nag_{chat_id}")[0]
+        job.schedule_removal()
+    except Exception:
+        pass
+    
+    await safe_reply(update.effective_message, "❌ Meetup cancelled.")
+
 
 async def meetup_nag_job(context: ContextTypes.DEFAULT_TYPE):
     chat_id = context.job.chat_id
@@ -656,18 +729,33 @@ async def meetup_nag_job(context: ContextTypes.DEFAULT_TYPE):
         return
 
     session_id = session["session_id"]
+    now = now_ts()
+    first_nag_ts = int(session["first_nag_ts"] or 0)
+    
+    # Don't nag until the timeout period has passed
+    if now < first_nag_ts:
+        return
+    
+    # Mark that we've started nagging (first nag)
+    nag_started = int(session["nag_started"] or 0)
+    if not nag_started:
+        await db_exec("UPDATE meetup_sessions SET nag_started=1 WHERE session_id=?", (session_id,))
 
     # Get all members in the chat
     all_members = await db_fetchall("SELECT user_id, username, first_name FROM members WHERE chat_id=?", (chat_id,))
 
-    # Get members who have voted
-    voted_users = await db_fetchall("SELECT DISTINCT user_id FROM meetup_votes WHERE session_id=?", (session_id,))
+    # Get members who have voted on this specific session (filter by area vote type)
+    voted_users = await db_fetchall("SELECT DISTINCT user_id FROM meetup_votes WHERE session_id=? AND vote_type='area'", (session_id,))
     voted_ids = {row["user_id"] for row in voted_users}
 
     # Find non-voters
     non_voters = [m for m in all_members if m["user_id"] not in voted_ids]
 
+    # If everyone has voted, stop nagging
     if not non_voters:
+        await safe_send(context.bot, chat_id, "✅ Everyone has voted! Meetup confirmed.")
+        await db_exec("UPDATE meetup_sessions SET status='confirmed' WHERE session_id=?", (session_id,))
+        context.job.schedule_removal()
         return
 
     # Mention non-voters
@@ -680,8 +768,44 @@ async def meetup_nag_job(context: ContextTypes.DEFAULT_TYPE):
             first_name = m["first_name"] or "someone"
             mentions.append(first_name)
 
-    nag_text = f"Oi {', '.join(mentions)}! Wake up. We are planning a meetup and you haven't voted. Don't be a snake. 🐍"
+    nag_text = f"⏰ **POLL REMINDER** – {', '.join(mentions)}! You haven't voted yet. Where should we meetup? Don't ghost the group! 👻"
     await safe_send(context.bot, chat_id, nag_text)
+
+async def meetup_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    
+    # Find active session
+    session = await db_fetchone("SELECT * FROM meetup_sessions WHERE chat_id=? AND status NOT IN ('confirmed', 'cancelled')", (chat_id,))
+    if not session:
+        await safe_reply(update.effective_message, "No active meetup.")
+        return
+    
+    session_id = session["session_id"]
+    
+    # Get all members
+    all_members = await db_fetchall("SELECT user_id, username, first_name FROM members WHERE chat_id=?", (chat_id,))
+    
+    # Get who voted (filter by area vote type)
+    voted_users = await db_fetchall("SELECT DISTINCT user_id FROM meetup_votes WHERE session_id=? AND vote_type='area'", (session_id,))
+    voted_ids = {row["user_id"] for row in voted_users}
+    
+    non_voters = [m for m in all_members if m["user_id"] not in voted_ids]
+    
+    # Get vote counts (filter by area vote type)
+    votes = await db_fetchall("SELECT vote_value, COUNT(*) as cnt FROM meetup_votes WHERE session_id=? AND vote_type='area' GROUP BY vote_value ORDER BY cnt DESC", (session_id,))
+    vote_summary = "\n".join([f"  {row['vote_value']}: {row['cnt']} votes" for row in votes]) if votes else "No votes yet"
+    
+    voted_list = ", ".join([f"@{u['username']}" if u['username'] else u['first_name'] or "someone" for u in [m for m in all_members if m['user_id'] in voted_ids]])
+    non_voter_list = ", ".join([f"@{u['username']}" if u['username'] else u['first_name'] or "someone" for u in non_voters])
+    
+    status_text = (
+        f"📊 **MEETUP STATUS**\n"
+        f"Voted: {voted_list or 'None'}\n"
+        f"Not voted: {non_voter_list or 'Everyone voted!'}\n\n"
+        f"**Results so far:**\n{vote_summary}"
+    )
+    
+    await safe_reply(update.effective_message, status_text)
 
 # ============================================================
 # Error handler
@@ -829,6 +953,11 @@ def main():
         .post_init(restore_jobs)
         .build()
     )
+    
+    # Ensure JobQueue is initialized
+    if app.job_queue is None:
+        app.job_queue = JobQueue()
+        app.job_queue.application = app
 
     # Commands
     app.add_handler(CommandHandler("start", start))
@@ -843,6 +972,8 @@ def main():
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("openai_test", openai_test))
     app.add_handler(CommandHandler("meetup", start_meetup))
+    app.add_handler(CommandHandler("meetup_cancel", meetup_cancel))
+    app.add_handler(CommandHandler("meetup_status", meetup_status))
 
     # Callback query handler for meetup buttons
     app.add_handler(CallbackQueryHandler(meetup_callback))
