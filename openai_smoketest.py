@@ -1,8 +1,9 @@
 import os
 from dotenv import load_dotenv
+from openai import OpenAI
+
 load_dotenv()
 
-from openai import OpenAI
 client = OpenAI()
 
 resp = client.responses.create(
@@ -11,11 +12,13 @@ resp = client.responses.create(
     max_output_tokens=32,
 )
 
-# Print output text
+# Collect output text
 out = []
+
 for item in resp.output:
     if item.type == "message":
         for c in item.content:
             if c.type == "output_text":
+                out.append(c.text)
 
 print("RESULT:", " ".join(out).strip())

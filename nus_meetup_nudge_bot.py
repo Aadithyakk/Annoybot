@@ -94,6 +94,12 @@ CANTEENS = {
     "Other": ["Techno Edge", "PGPR"]
 }
 
+# Time slots for meetup voting
+TIME_SLOTS = [
+    "11:00 AM", "11:30 AM", "12:00 PM", "12:30 PM",
+    "1:00 PM", "1:30 PM", "2:00 PM", "5:00 PM", "6:00 PM"
+]
+
 # ============================================================
 # DB
 # ============================================================
@@ -351,19 +357,23 @@ async def llm_reply(chat_id: int, roast_level: int, user_name: str, text: str, m
 # Commands
 # ============================================================
 HELP_TEXT = (
-    "Annoyotron commands:\n"
+    "🤖 Annoyotron commands:\n\n"
+    "**Chat Mode:**\n"
     "/chaos_on – I start chatting like a real group member\n"
     "/chaos_off – I shut up (mostly)\n"
     "/roast_level <1-5> – set roast intensity\n"
-    "/roast_optin – you consent to slightly spicier teasing\n"
-    "/roast_optout – opt out\n"
-    "/autopoke_on [minutes] – I will message on my own schedule\n"
-    "/autopoke_off – stop autopoke\n"
-    "/openai_test – test OpenAI from Telegram\n"
-    "/meetup [timeout_min] [nag_interval_min] – start a meetup poll (e.g. /meetup 2 3)\n"
-    "/meetup_status – show voting progress\n"
-    "/meetup_cancel – cancel the current meetup\n"
-    "/status – show current settings\n"
+    "/roast_optin – you consent to spicier teasing\n"
+    "/roast_optout – opt out of spicy roasts\n\n"
+    "**Meetups:**\n"
+    "/meetup [nag_interval] – start a meetup poll\n"
+    "/meetup_status – check current meetup\n"
+    "/meetup_cancel – cancel active meetup\n"
+    "💡 Just @ me and say 'can we change timing?' for smart suggestions!\n\n"
+    "**Auto-Poke:**\n"
+    "/autopoke_on [minutes] – I message on my own schedule\n"
+    "/autopoke_off – stop autopoke\n\n"
+    "/status – show settings\n"
+    "/openai_test – test AI\n"
 )
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -670,24 +680,137 @@ async def meetup_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     votes = await db_fetchall("SELECT vote_value, COUNT(*) as cnt FROM meetup_votes WHERE session_id=? AND vote_type=? GROUP BY vote_value ORDER BY cnt DESC", (session_id, vote_type))
     vote_map = {row['vote_value']: row['cnt'] for row in votes}
     
-    # Rebuild keyboard with vote counts
+    # Check if we should transition to time voting (if area has majority)
+    session = await db_fetchone("SELECT * FROM meetup_sessions WHERE session_id=?", (session_id,))
+    if not session:
+        return
+
+    status = session["status"]
+
+    # Check for transition from area → time
+    if vote_type == "area" and status == "collecting_area":
+        # Count total voters for area
+        total_voters = await db_fetchone("SELECT COUNT(DISTINCT user_id) as cnt FROM meetup_votes WHERE session_id=? AND vote_type='area'", (session_id,))
+        voter_count = total_voters["cnt"] if total_voters else 0
+
+        # If 3+ voters, move to time voting
+        if voter_count >= 3:
+            # Get winning area
+            if votes:
+                winning_area = votes[0]["vote_value"]
+                await db_exec("UPDATE meetup_sessions SET status='collecting_time', area=? WHERE session_id=?", (winning_area, session_id))
+
+                # Create time voting keyboard
+                keyboard = []
+                for time_slot in TIME_SLOTS:
+                    keyboard.append([InlineKeyboardButton(time_slot, callback_data=f"time_{chat_id_str}_{ts_str}_{time_slot}")])
+
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                await query.edit_message_text(f"✅ **{winning_area}** wins!\n\n⏰ Now vote for time:", reply_markup=reply_markup, parse_mode="Markdown")
+                return
+
+    # Check for confirmation (time voting done)
+    if vote_type == "time" and status == "collecting_time":
+        total_voters = await db_fetchone("SELECT COUNT(DISTINCT user_id) as cnt FROM meetup_votes WHERE session_id=? AND vote_type='time'", (session_id,))
+        voter_count = total_voters["cnt"] if total_voters else 0
+
+        if voter_count >= 3:
+            if votes:
+                winning_time = votes[0]["vote_value"]
+                winning_area = session["area"]
+                await db_exec("UPDATE meetup_sessions SET status='confirmed', time=?, confirmed_ts=? WHERE session_id=?", (winning_time, now_ts(), session_id))
+
+                # Stop nagging
+                try:
+                    job = context.application.job_queue.get_jobs_by_name(f"nag_{chat_id}")[0]
+                    job.schedule_removal()
+                except Exception:
+                    pass
+
+                # Schedule reminder
+                _schedule_meetup_reminder(context.application, chat_id, session_id, winning_area, winning_time)
+
+                await query.edit_message_text(f"🎉 **MEETUP CONFIRMED!**\n\n📍 {winning_area}\n⏰ {winning_time}\n\nI'll remind everyone 30 min before!", parse_mode="Markdown")
+                return
+
+    # Regular vote display
     if vote_type == "area":
         options = list(CANTEENS.keys())
     else:
-        # If time voting, get available times (for now, just show areas)
-        options = list(CANTEENS.keys())
-    
+        options = TIME_SLOTS
+
     keyboard = []
     for option in options:
         count = vote_map.get(option, 0)
         button_text = f"{option} ({count})" if count > 0 else option
         callback = f"{vote_type}_{chat_id_str}_{ts_str}_{option}"
         keyboard.append([InlineKeyboardButton(button_text, callback_data=callback)])
-    
+
     reply_markup = InlineKeyboardMarkup(keyboard)
     vote_summary = "\n".join([f"{row['vote_value']}: {row['cnt']} votes" for row in votes]) if votes else "No votes yet"
-    
-    await query.edit_message_text(f"📊 **MEETUP POLL** – Where we going?\n\n{vote_summary}\n\n(Vote to continue, or wait for results)", reply_markup=reply_markup, parse_mode="Markdown")
+
+    phase = "Where" if vote_type == "area" else "When"
+    await query.edit_message_text(f"📊 **MEETUP POLL** – {phase}?\n\n{vote_summary}\n\n(Need 3 votes to proceed)", reply_markup=reply_markup, parse_mode="Markdown")
+
+def _schedule_meetup_reminder(application: Application, chat_id: int, session_id: str, area: str, time_str: str):
+    """Schedule a reminder 30 minutes before the meetup time."""
+    # Parse time (simple version - assumes today)
+    from datetime import datetime, timedelta
+    try:
+        # Parse time like "12:00 PM"
+        meetup_time = datetime.strptime(time_str, "%I:%M %p")
+        now = datetime.now()
+        # Set to today
+        meetup_datetime = now.replace(hour=meetup_time.hour, minute=meetup_time.minute, second=0, microsecond=0)
+
+        # If time already passed today, assume tomorrow
+        if meetup_datetime <= now:
+            meetup_datetime += timedelta(days=1)
+
+        # Schedule reminder 30 min before
+        reminder_time = meetup_datetime - timedelta(minutes=30)
+        delay = (reminder_time - now).total_seconds()
+
+        if delay > 0:
+            application.job_queue.run_once(
+                meetup_reminder_job,
+                when=delay,
+                chat_id=chat_id,
+                name=f"reminder_{session_id}",
+                data={"session_id": session_id, "area": area, "time": time_str}
+            )
+            logger.info(f"Scheduled reminder for {session_id} at {reminder_time}")
+    except Exception as e:
+        logger.warning(f"Failed to schedule reminder: {e}")
+
+async def meetup_reminder_job(context: ContextTypes.DEFAULT_TYPE):
+    """Send reminder for confirmed meetup."""
+    chat_id = context.job.chat_id
+    data = context.job.data
+    session_id = data["session_id"]
+    area = data["area"]
+    time_str = data["time"]
+
+    # Get all voters
+    voters = await db_fetchall("SELECT DISTINCT user_id FROM meetup_votes WHERE session_id=?", (session_id,))
+
+    # Get member info
+    mentions = []
+    for voter in voters[:10]:  # Limit to 10
+        user_id = voter["user_id"]
+        member = await db_fetchone("SELECT username, first_name FROM members WHERE chat_id=? AND user_id=?", (chat_id, user_id))
+        if member:
+            username = member["username"]
+            if username:
+                mentions.append(f"@{username}")
+            else:
+                first_name = member["first_name"] or "someone"
+                mentions.append(first_name)
+
+    mention_text = " ".join(mentions) if mentions else "Everyone"
+    reminder_text = f"⏰ **MEETUP REMINDER!**\n\n{mention_text}\n\nMeetup in 30 minutes!\n📍 {area}\n⏰ {time_str}\n\nDon't be late! 🏃"
+
+    await safe_send(context.bot, chat_id, reminder_text)
 
 async def meetup_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -716,6 +839,51 @@ async def meetup_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
     
     await safe_reply(update.effective_message, "❌ Meetup cancelled.")
+
+async def meetup_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show current meetup status."""
+    chat_id = update.effective_chat.id
+
+    # Find active or recent session
+    session = await db_fetchone("SELECT * FROM meetup_sessions WHERE chat_id=? ORDER BY created_ts DESC LIMIT 1", (chat_id,))
+    if not session:
+        await safe_reply(update.effective_message, "No meetup sessions found. Start one with /meetup")
+        return
+
+    session_id = session["session_id"]
+    status = session["status"]
+    area = session["area"] or "TBD"
+    time = session["time"] or "TBD"
+
+    if status == "cancelled":
+        await safe_reply(update.effective_message, "❌ Last meetup was cancelled.")
+        return
+
+    if status == "confirmed":
+        # Get voters
+        voters = await db_fetchall("SELECT DISTINCT user_id FROM meetup_votes WHERE session_id=?", (session_id,))
+        voter_count = len(voters)
+        await safe_reply(
+            update.effective_message,
+            f"✅ **MEETUP CONFIRMED**\n\n📍 {area}\n⏰ {time}\n👥 {voter_count} people voting\n\nReminder will be sent 30 min before!"
+        )
+        return
+
+    # In progress
+    if status == "collecting_area":
+        votes = await db_fetchall("SELECT vote_value, COUNT(*) as cnt FROM meetup_votes WHERE session_id=? AND vote_type='area' GROUP BY vote_value ORDER BY cnt DESC", (session_id,))
+        vote_summary = "\n".join([f"  {row['vote_value']}: {row['cnt']}" for row in votes]) if votes else "  No votes yet"
+        await safe_reply(
+            update.effective_message,
+            f"📊 **Meetup in progress** (voting for location)\n\n{vote_summary}\n\nNeed 3 votes to proceed to time selection."
+        )
+    elif status == "collecting_time":
+        votes = await db_fetchall("SELECT vote_value, COUNT(*) as cnt FROM meetup_votes WHERE session_id=? AND vote_type='time' GROUP BY vote_value ORDER BY cnt DESC", (session_id,))
+        vote_summary = "\n".join([f"  {row['vote_value']}: {row['cnt']}" for row in votes]) if votes else "  No votes yet"
+        await safe_reply(
+            update.effective_message,
+            f"📊 **Meetup in progress** (voting for time)\n📍 Location: {area}\n\n{vote_summary}\n\nNeed 3 votes to confirm."
+        )
 
 
 async def meetup_nag_job(context: ContextTypes.DEFAULT_TYPE):
@@ -771,41 +939,60 @@ async def meetup_nag_job(context: ContextTypes.DEFAULT_TYPE):
     nag_text = f"⏰ **POLL REMINDER** – {', '.join(mentions)}! You haven't voted yet. Where should we meetup? Don't ghost the group! 👻"
     await safe_send(context.bot, chat_id, nag_text)
 
-async def meetup_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    
-    # Find active session
-    session = await db_fetchone("SELECT * FROM meetup_sessions WHERE chat_id=? AND status NOT IN ('confirmed', 'cancelled')", (chat_id,))
+# ============================================================
+# Smart meetup suggestion from natural language
+# ============================================================
+async def analyze_meetup_intent(chat_id: int, user_name: str, text: str) -> Optional[str]:
+    """Use LLM to detect meetup timing changes or suggestions."""
+    if not USE_OPENAI or not oai_client:
+        return None
+
+    # Check if there's an active meetup
+    session = await db_fetchone("SELECT * FROM meetup_sessions WHERE chat_id=? AND status IN ('collecting_area', 'collecting_time', 'confirmed') ORDER BY created_ts DESC LIMIT 1", (chat_id,))
+
     if not session:
-        await safe_reply(update.effective_message, "No active meetup.")
-        return
-    
+        return None
+
     session_id = session["session_id"]
-    
-    # Get all members
-    all_members = await db_fetchall("SELECT user_id, username, first_name FROM members WHERE chat_id=?", (chat_id,))
-    
-    # Get who voted (filter by area vote type)
-    voted_users = await db_fetchall("SELECT DISTINCT user_id FROM meetup_votes WHERE session_id=? AND vote_type='area'", (session_id,))
-    voted_ids = {row["user_id"] for row in voted_users}
-    
-    non_voters = [m for m in all_members if m["user_id"] not in voted_ids]
-    
-    # Get vote counts (filter by area vote type)
-    votes = await db_fetchall("SELECT vote_value, COUNT(*) as cnt FROM meetup_votes WHERE session_id=? AND vote_type='area' GROUP BY vote_value ORDER BY cnt DESC", (session_id,))
-    vote_summary = "\n".join([f"  {row['vote_value']}: {row['cnt']} votes" for row in votes]) if votes else "No votes yet"
-    
-    voted_list = ", ".join([f"@{u['username']}" if u['username'] else u['first_name'] or "someone" for u in [m for m in all_members if m['user_id'] in voted_ids]])
-    non_voter_list = ", ".join([f"@{u['username']}" if u['username'] else u['first_name'] or "someone" for u in non_voters])
-    
-    status_text = (
-        f"📊 **MEETUP STATUS**\n"
-        f"Voted: {voted_list or 'None'}\n"
-        f"Not voted: {non_voter_list or 'Everyone voted!'}\n\n"
-        f"**Results so far:**\n{vote_summary}"
-    )
-    
-    await safe_reply(update.effective_message, status_text)
+    area = session["area"] or "not decided yet"
+    time = session["time"] or "not decided yet"
+    status = session["status"]
+
+    prompt = f"""Current meetup: {area} at {time} (status: {status})
+
+User said: "{text}"
+
+Does the user want to:
+1. Change the meetup time?
+2. Suggest a different timing?
+3. Ask about changing timing?
+
+If yes, reply with ONLY ONE of these actions:
+- "SUGGEST_CHANGE:<their proposed time>" (e.g. "SUGGEST_CHANGE:2PM")
+- "ASK_ALTERNATIVES" (they want to discuss timing)
+- "NO_ACTION" (not related to timing)
+
+Be concise."""
+
+    def _call():
+        resp = oai_client.responses.create(
+            model="gpt-4.1-mini",
+            input=prompt,
+            max_output_tokens=50,
+        )
+        out = []
+        for item in resp.output:
+            if item.type == "message":
+                for c in item.content:
+                    if c.type == "output_text":
+                        out.append(c.text)
+        return " ".join(out).strip() or None
+
+    try:
+        return await asyncio.to_thread(_call)
+    except Exception as e:
+        logger.warning(f"Meetup intent analysis failed: {e}")
+        return None
 
 # ============================================================
 # Error handler
@@ -912,6 +1099,23 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if should_rate_limit(chat.id, user.id):
         return
 
+    # Check for meetup timing intent
+    meetup_action = await analyze_meetup_intent(chat.id, user.first_name or "User", text)
+    if meetup_action and meetup_action != "NO_ACTION":
+        if meetup_action.startswith("SUGGEST_CHANGE:"):
+            proposed_time = meetup_action.split(":", 1)[1]
+            reply = f"Noted! {user.first_name} wants to change to {proposed_time}. Should we revote? 🤔"
+        elif meetup_action == "ASK_ALTERNATIVES":
+            reply = "Let me check what times work for everyone... Anyone else have timing issues? Drop your preferred times!"
+        else:
+            reply = None
+
+        if reply:
+            await safe_reply(msg, reply)
+            remember(chat.id, "assistant", reply)
+            mark_replied(chat.id, user.id)
+            return
+
     # Respect per-user opt-in/out (opt-out reduces roast slightly)
     mrow = await db_fetchone("SELECT roast_opt_in FROM members WHERE chat_id=? AND user_id=?", (chat.id, user.id))
     user_opt_in = int(mrow["roast_opt_in"] or 0) if mrow else 0
@@ -926,7 +1130,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     if not reply:
-        reply = "👀 I’m here. Say my name or use /help."
+        reply = "👀 I'm here. Say my name or use /help."
 
     await safe_reply(msg, reply)
     remember(chat.id, "assistant", reply)
