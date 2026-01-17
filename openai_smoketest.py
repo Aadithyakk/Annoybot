@@ -17,6 +17,5 @@ for item in resp.output:
     if item.type == "message":
         for c in item.content:
             if c.type == "output_text":
-                out.append(c.text)
 
 print("RESULT:", " ".join(out).strip())

@@ -690,6 +690,24 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     logger.error("Exception while handling an update:", exc_info=context.error)
 
 # ============================================================
+# Helper: Check if bot is mentioned using entities
+# ============================================================
+def is_bot_mentioned(msg, bot_username: str) -> bool:
+    if not msg or not bot_username:
+        return False
+    uname = bot_username.lower()
+    text = (msg.text or "") + (msg.caption or "")
+    entities = list(msg.entities or []) + list(msg.caption_entities or [])
+    for e in entities:
+        # @username mention
+        if e.type == "mention":
+            seg = text[e.offset:e.offset + e.length].lower()
+            if seg == f"@{uname}":
+                return True
+    # fallback substring
+    return f"@{uname}" in text.lower()
+
+# ============================================================
 # Main message handler: LLM-style replies
 # ============================================================
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -754,8 +772,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Decide when to respond
-    bot_username = (context.bot.username or "").lower()
-    mentioned = bot_username and (f"@{bot_username}" in text_l)
+    bot_username = (context.bot.username or "")
+    mentioned = is_bot_mentioned(msg, bot_username)
 
     replied_to_bot = False
     if msg.reply_to_message and msg.reply_to_message.from_user:
